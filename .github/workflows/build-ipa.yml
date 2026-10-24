@@ -1,5 +1,4 @@
-
-name: Build Hermes Mobile IPA
+name: Build Hermes qusai IPA
 
 on:
   workflow_dispatch:
@@ -9,35 +8,73 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: Select available Xcode
+        shell: bash
         run: |
-          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          set -euo pipefail
+
+          echo "Installed Xcode applications:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+
           xcodebuild -version
+          xcodebuild -showsdks
 
       - name: Install Tuist
+        shell: bash
         run: |
+          set -euo pipefail
           brew install tuist
           tuist version
 
-      - name: Generate Xcode project
+      - name: Install project dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           tuist install
+
+      - name: Generate Xcode workspace
+        shell: bash
+        run: |
+          set -euo pipefail
           tuist generate --no-open
 
-      - name: Show available schemes
-        run: |
-          xcodebuild -list
+          if [ ! -d "HermesMobile.xcworkspace" ]; then
+            echo "::error::Generated workspace HermesMobile.xcworkspace not found."
+            find . -maxdepth 3 \
+              \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) \
+              -print
+            exit 1
+          fi
 
-      - name: Build iOS app without signing
+      - name: Verify workspace and scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild -list \
+            -workspace HermesMobile.xcworkspace \
+            | tee "$RUNNER_TEMP/xcode-list.log"
+
+          if ! grep -Eq '^[[:space:]]+HermesMobile[[:space:]]*$' \
+            "$RUNNER_TEMP/xcode-list.log"; then
+            echo "::error::Scheme HermesMobile was not found."
+            exit 1
+          fi
+
+      - name: Build unsigned iOS Release
+        shell: bash
         run: |
           set -o pipefail
+
           xcodebuild \
+            -workspace HermesMobile.xcworkspace \
             -scheme HermesMobile \
             -configuration Release \
             -destination 'generic/platform=iOS' \
@@ -45,25 +82,64 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tee "$RUNNER_TEMP/build.log"
 
-      - name: Package unsigned IPA
+      - name: Find the actual app bundle
+        shell: bash
         run: |
-          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/HermesMobile.app"
+          set -euo pipefail
 
-          if [ ! -d "$APP" ]; then
-            echo "ERROR: HermesMobile.app was not found."
-            find "$RUNNER_TEMP/DerivedData/Build/Products" \
-              -maxdepth 3 -name '*.app' -print
+          PRODUCTS="$RUNNER_TEMP/DerivedData/Build/Products"
+          EXPECTED_ID="me.honcharenko.HermesMobile"
+          APP_PATH=""
+
+          while IFS= read -r -d '' candidate; do
+            INFO="$candidate/Info.plist"
+
+            [ -f "$INFO" ] || continue
+
+            BUNDLE_ID=$(
+              /usr/libexec/PlistBuddy \
+                -c 'Print :CFBundleIdentifier' "$INFO" 2>/dev/null \
+                || true
+            )
+
+            echo "Found app: $candidate"
+            echo "Bundle ID: $BUNDLE_ID"
+
+            if [ "$BUNDLE_ID" = "$EXPECTED_ID" ]; then
+              APP_PATH="$candidate"
+              break
+            fi
+          done < <(
+            find "$PRODUCTS" -type d -name '*.app' -print0
+          )
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::App with bundle ID $EXPECTED_ID was not found."
+            find "$PRODUCTS" -maxdepth 4 \
+              \( -name '*.app' -o -name '*.xctest' \) -print
             exit 1
           fi
 
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
-          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/"
 
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
             "$RUNNER_TEMP/ipa/Payload" \
             "$RUNNER_TEMP/HermesMobile-unsigned.ipa"
 
-      - name: Upload IPA artifact
+          echo "IPA created:"
+          ls -lh "$RUNNER_TEMP/HermesMobile-unsigned.ipa"
+
+          unzip -l "$RUNNER_TEMP/HermesMobile-unsigned.ipa"
+
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
           name: HermesMobile-unsigned-IPA
@@ -71,11 +147,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build log
+      - name: Upload diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HermesMobile-build-log
-          path: ${{ runner.temp }}/build.log
+          name: HermesMobile-build-diagnostics
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/xcode-list.log
           if-no-files-found: ignore
           retention-days: 7
