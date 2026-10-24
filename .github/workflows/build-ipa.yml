@@ -1,4 +1,4 @@
-name: Build Hermes qusai IPA
+name: Build Hermes Mobile unsigned IPA
 
 on:
   workflow_dispatch:
@@ -68,6 +68,23 @@ jobs:
             exit 1
           fi
 
+      - name: Approve Swift macros for CI
+        # Package macros (ComposableArchitectureMacros, CasePathsMacros,
+        # DependenciesMacrosPlugin, PerceptionMacros) need a one-time user
+        # approval in Xcode ("Trust & Enable"). A headless runner has nobody to
+        # click it, so xcodebuild fails in ComputeTargetDependencyGraph with
+        # "Macro ... must be enabled before it can be used".
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+
+          echo "Macro fingerprint validation disabled for this runner:"
+          defaults read com.apple.dt.Xcode IDESkipMacroFingerprintValidation
+          defaults read com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation
+
       - name: Build unsigned iOS Release
         shell: bash
         run: |
@@ -80,6 +97,7 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
+            -skipMacroValidation \
             build 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: Find the actual app bundle
